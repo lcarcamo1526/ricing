@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# Fix grammar of the current selection, fully offline, via the local LanguageTool server.
+# Auto-detects the language (fastText). Set LT_LANG to force one, e.g. LT_LANG=es.
+
+set -euo pipefail
+
+LT_URL="${LT_URL:-http://localhost:8081/v2/check}"
+LANG_CODE="${LT_LANG:-auto}"
+HELPER="$HOME/.config/hypr/scripts/lt-apply.py"
+
+notify() { notify-send -a "grammar-fix" -t 3000 "$1" "${2:-}"; }
+
+# ydotoold's socket, as created by the user unit (systemctl --user start ydotool).
+export YDOTOOL_SOCKET="${YDOTOOL_SOCKET:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/.ydotool_socket}"
+
+if [[ ! -S "$YDOTOOL_SOCKET" ]]; then
+    notify "ydotoold not running" "systemctl --user enable --now ydotool"
+    exit 1
+fi
+
+OLD_CLIP="$(wl-paste 2>/dev/null || true)"
+restore_clip() { printf '%s' "$OLD_CLIP" | wl-copy 2>/dev/null || true; }
+
+# Clear the clipboard first: if Ctrl+C fails, we must not silently reuse the
+# previous clipboard contents and "fix" unrelated text.
+SENTINEL="__grammar_fix_$$__"
+printf '%s' "$SENTINEL" | wl-copy
+sleep 0.1
+
+copy_selection() {
+    ydotool key --key-delay 12 29:1 46:1 46:0 29:0   # ctrl+c
+}
+
+TEXT=""
+for attempt in 1 2 3; do
+    copy_selection
+    sleep 0.3
+    CLIP="$(wl-paste 2>/dev/null || true)"
+    if [[ -n "$CLIP" && "$CLIP" != "$SENTINEL" ]]; then
+        TEXT="$CLIP"
+        break
+    fi
+done
+
+if [[ -z "$TEXT" ]]; then
+    notify "Could not copy selection" "Select text first, or this app blocks Ctrl+C"
+    restore_clip
+    exit 1
+fi
+
+if [[ -z "${TEXT//[[:space:]]/}" ]]; then
+    notify "Nothing selected"
+    restore_clip
+    exit 0
+fi
+
+RESPONSE="$(curl -sS --max-time 20 "$LT_URL" \
+    --data-urlencode "text=$TEXT" \
+    --data "language=$LANG_CODE" \
+    --data "level=picky")" || {
+        notify "LanguageTool unreachable" "sudo systemctl start languagetool"
+        restore_clip
+        exit 1
+    }
+
+DETECTED="$(jq -r '.language.detectedLanguage.name // .language.name // "?"' <<<"$RESPONSE" 2>/dev/null)"
+COUNT="$(jq -r '[.matches[] | select((.replacements|length) > 0)] | length' <<<"$RESPONSE" 2>/dev/null || echo 0)"
+
+if [[ "$COUNT" == "0" ]]; then
+    notify "No issues found" "$DETECTED"
+    restore_clip
+    exit 0
+fi
+
+ERRFILE="$(mktemp)"
+trap 'rm -f "$ERRFILE"' EXIT
+set +e
+FIXED="$(python3 -I "$HELPER" "$TEXT" <<<"$RESPONSE" 2>"$ERRFILE")"
+RC=$?
+set -e
+if [[ $RC -eq 2 ]]; then
+    # Detection was not trustworthy; refuse rather than mangle the text.
+    notify "Skipped: unsure of language" "$(head -1 "$ERRFILE")"
+    restore_clip
+    exit 0
+elif [[ $RC -ne 0 ]]; then
+    notify "Failed to apply corrections"
+    restore_clip
+    exit 1
+fi
+
+if [[ -z "$FIXED" || "$FIXED" == "$TEXT" ]]; then
+    notify "Nothing changed" "$DETECTED"
+    restore_clip
+    exit 0
+fi
+
+printf '%s' "$FIXED" | wl-copy
+sleep 0.25
+ydotool key --key-delay 12 29:1 47:1 47:0 29:0   # ctrl+v
+sleep 0.35
+
+restore_clip
+
+# The helper prints the diff list on stderr line 2 when there are few enough
+# corrections to fit in a notification.
+DIFFS="$(sed -n '2p' "$ERRFILE")"
+if [[ -n "$DIFFS" ]]; then
+    notify "Fixed $COUNT · $DETECTED" "$DIFFS"
+else
+    notify "Fixed $COUNT issue(s)" "$DETECTED"
+fi

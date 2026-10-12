@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# Rewrite the current selection via an LLM on OpenRouter.
+# Unlike the offline LanguageTool version, this also fixes awkward phrasing.
+# Key: ~/.config/hypr/scripts/.openrouter-key   (chmod 600)
+
+set -euo pipefail
+
+KEYFILE="$HOME/.config/hypr/scripts/.openrouter-key"
+PRIMARY="${LLM_MODEL:-google/gemini-3.5-flash-lite}"
+FALLBACK="${LLM_FALLBACK:-nvidia/nemotron-3-super-120b-a12b:free}"
+
+export YDOTOOL_SOCKET="${YDOTOOL_SOCKET:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/.ydotool_socket}"
+
+notify() { notify-send -a "grammar-llm" -t 4000 "$1" "${2:-}"; }
+
+[[ -S "$YDOTOOL_SOCKET" ]] || { notify "ydotoold not running" "systemctl --user start ydotool"; exit 1; }
+[[ -r "$KEYFILE" ]] || { notify "No OpenRouter key" "Put it in $KEYFILE"; exit 1; }
+API_KEY="$(tr -d '[:space:]' <"$KEYFILE")"
+
+OLD_CLIP="$(wl-paste 2>/dev/null || true)"
+restore_clip() { printf '%s' "$OLD_CLIP" | wl-copy 2>/dev/null || true; }
+
+# Sentinel so a failed Ctrl+C cannot silently reuse the old clipboard.
+SENTINEL="__grammar_llm_$$__"
+printf '%s' "$SENTINEL" | wl-copy
+sleep 0.1
+
+TEXT=""
+for _ in 1 2 3; do
+    ydotool key --key-delay 12 29:1 46:1 46:0 29:0   # ctrl+c
+    sleep 0.3
+    CLIP="$(wl-paste 2>/dev/null || true)"
+    if [[ -n "$CLIP" && "$CLIP" != "$SENTINEL" ]]; then TEXT="$CLIP"; break; fi
+done
+
+if [[ -z "${TEXT//[[:space:]]/}" ]]; then
+    notify "Could not copy selection" "Select text first"
+    restore_clip
+    exit 1
+fi
+
+SYSTEM='Correct grammar, spelling and punctuation. Preserve the original meaning, tone, language and formatting. Remove redundancy and improve awkward phrasing so the text reads fluently. Reply with the corrected text and nothing else: no quotes, no commentary, no explanation.'
+
+ask_model() {
+    curl -sS --max-time 45 https://openrouter.ai/api/v1/chat/completions \
+        -H "Authorization: Bearer $API_KEY" \
+        -H "Content-Type: application/json" \
+        -H "HTTP-Referer: https://localhost/grammar-fix" \
+        -H "X-Title: grammar-fix" \
+        -d "$(jq -n --arg m "$1" --arg s "$SYSTEM" --arg t "$TEXT" '{
+              model: $m,
+              temperature: 0,
+              max_tokens: 2048,
+              messages: [{role:"system",content:$s},{role:"user",content:$t}]
+            }')"
+}
+
+extract() { jq -er '.choices[0].message.content' <<<"$1" 2>/dev/null; }
+
+notify "Fixing…" "$PRIMARY"
+RESPONSE="$(ask_model "$PRIMARY" || true)"
+MODEL_USED="$PRIMARY"
+
+if ! FIXED="$(extract "$RESPONSE")"; then
+    # Free tiers rate-limit; fall back to the cheap paid model.
+    RESPONSE="$(ask_model "$FALLBACK" || true)"
+    MODEL_USED="$FALLBACK"
+    if ! FIXED="$(extract "$RESPONSE")"; then
+        ERR="$(jq -r '.error.message // "no response"' <<<"$RESPONSE" 2>/dev/null)"
+        notify "LLM failed" "$ERR"
+        restore_clip
+        exit 1
+    fi
+fi
+
+# Models sometimes wrap the answer in quotes or a code fence despite instructions.
+FIXED="$(printf '%s' "$FIXED" | sed -e '1{/^```/d}' -e '${/^```$/d}')"
+FIXED="${FIXED#\"}"; FIXED="${FIXED%\"}"
+FIXED="$(printf '%s' "$FIXED" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+
+if [[ -z "$FIXED" ]]; then
+    notify "Empty response" "$MODEL_USED"
+    restore_clip
+    exit 1
+fi
+
+if [[ "$FIXED" == "$TEXT" ]]; then
+    notify "No changes needed" "${MODEL_USED##*/}"
+    restore_clip
+    exit 0
+fi
+
+printf '%s' "$FIXED" | wl-copy
+sleep 0.25
+ydotool key --key-delay 12 29:1 47:1 47:0 29:0   # ctrl+v
+sleep 0.35
+
+restore_clip
+notify "Rewritten" "${MODEL_USED##*/}"
