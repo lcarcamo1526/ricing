@@ -6,12 +6,12 @@
 set -euo pipefail
 
 KEYFILE="$HOME/.config/hypr/scripts/.openrouter-key"
-PRIMARY="${LLM_MODEL:-google/gemini-3.5-flash-lite}"
-FALLBACK="${LLM_FALLBACK:-nvidia/nemotron-3-super-120b-a12b:free}"
+PRIMARY="${LLM_MODEL:-anthropic/claude-haiku-5.5}"
+FALLBACK="${LLM_FALLBACK:-openai/gpt-oss-20b}"
 
 export YDOTOOL_SOCKET="${YDOTOOL_SOCKET:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/.ydotool_socket}"
 
-notify() { notify-send -a "grammar-llm" -t 4000 "$1" "${2:-}"; }
+notify() { notify-send -a "grammar-llm" -t "${NOTIFY_MS:-12000}" "$1" "${2:-}"; }
 
 [[ -S "$YDOTOOL_SOCKET" ]] || { notify "ydotoold not running" "systemctl --user start ydotool"; exit 1; }
 [[ -r "$KEYFILE" ]] || { notify "No OpenRouter key" "Put it in $KEYFILE"; exit 1; }
@@ -51,13 +51,14 @@ ask_model() {
               model: $m,
               temperature: 0,
               max_tokens: 2048,
-              messages: [{role:"system",content:$s},{role:"user",content:$t}]
+              messages: [{role:"system",content:$s},{role:"user",content:$t}],
+              provider: {data_collection: "deny"}
             }')"
 }
 
 extract() { jq -er '.choices[0].message.content' <<<"$1" 2>/dev/null; }
 
-notify "Fixing…" "$PRIMARY"
+NOTIFY_MS=2000 notify "Fixing…" ""
 RESPONSE="$(ask_model "$PRIMARY" || true)"
 MODEL_USED="$PRIMARY"
 
@@ -85,7 +86,7 @@ if [[ -z "$FIXED" ]]; then
 fi
 
 if [[ "$FIXED" == "$TEXT" ]]; then
-    notify "No changes needed" "${MODEL_USED##*/}"
+    notify "No changes needed" ""
     restore_clip
     exit 0
 fi
@@ -96,4 +97,16 @@ ydotool key --key-delay 12 29:1 47:1 47:0 29:0   # ctrl+v
 sleep 0.35
 
 restore_clip
-notify "Rewritten" "${MODEL_USED##*/}"
+
+# Summarise what changed, word by word, so the correction is visible.
+DIFF_OUT="$(python3 -I "$HOME/.config/hypr/scripts/word-diff.py" "$TEXT" "$FIXED" 2>/dev/null || true)"
+COUNT="$(sed -n 's/^COUNT=//p' <<<"$DIFF_OUT")"
+DETAIL="$(sed -n '2p' <<<"$DIFF_OUT")"
+
+if [[ -n "$DETAIL" ]]; then
+    notify "Fixed ${COUNT}" "$DETAIL"
+elif [[ -n "$COUNT" ]]; then
+    notify "Fixed ${COUNT} changes" ""
+else
+    notify "Rewritten" ""
+fi
