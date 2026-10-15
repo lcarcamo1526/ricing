@@ -1,0 +1,11 @@
+# Never commit API keys
+.openrouter-key
+.anthropic-key
+*.key
+**/.openrouter-key
+**/.anthropic-key
+
+# Editor/OS noise
+*.bak
+*.swp
+.DS_Store

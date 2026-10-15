@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# Correct text from stdin, write the result to stdout. No clipboard, no ydotool.
+# Used by the neovim integration and usable as a plain filter:
+#     echo "i has a apple" | grammar-stdin llm
+#
+#   $1 = engine: llm (default) | offline
+
+set -euo pipefail
+
+ENGINE="${1:-llm}"
+KEYFILE="$HOME/.config/hypr/scripts/.openrouter-key"
+PRIMARY="${LLM_MODEL:-anthropic/claude-haiku-5.5}"
+FALLBACK="${LLM_FALLBACK:-openai/gpt-oss-20b}"
+LT_URL="${LT_URL:-http://localhost:8081/v2/check}"
+
+notify() { notify-send -a "grammar-fix" -t "${NOTIFY_MS:-12000}" "$1" "${2:-}" 2>/dev/null || true; }
+
+TEXT="$(cat)"
+if [[ -z "${TEXT//[[:space:]]/}" ]]; then printf '%s' "$TEXT"; exit 0; fi
+
+emit_diff() {
+    local before="$1" after="$2" note="${3:-}"
+    local d count detail body
+    d="$(python3 -I "$HOME/.config/hypr/scripts/word-diff.py" "$before" "$after" 2>/dev/null || true)"
+    count="$(sed -n 's/^COUNT=//p' <<<"$d")"
+    detail="$(sed -n '2p' <<<"$d")"
+    body="$detail"
+    [[ -n "$note" ]] && body="${body:+$body$'\n'}💡 $note"
+    [[ -n "$count" ]] && notify "Fixed ${count}" "$body"
+}
+
+if [[ "$ENGINE" == "offline" ]]; then
+    RESPONSE="$(curl -sS --max-time 20 "$LT_URL" \
+        --data-urlencode "text=$TEXT" --data "language=auto" --data "level=picky")" || {
+            notify "LanguageTool unreachable" ""; printf '%s' "$TEXT"; exit 0; }
+    set +e
+    FIXED="$(python3 -I "$HOME/.config/hypr/scripts/lt-apply.py" "$TEXT" <<<"$RESPONSE" 2>/dev/null)"
+    RC=$?
+    set -e
+    if [[ $RC -ne 0 || -z "$FIXED" ]]; then
+        notify "Skipped" "language not recognised"; printf '%s' "$TEXT"; exit 0
+    fi
+    emit_diff "$TEXT" "$FIXED"
+    printf '%s' "$FIXED"
+    exit 0
+fi
+
+[[ -r "$KEYFILE" ]] || { notify "No OpenRouter key" ""; printf '%s' "$TEXT"; exit 0; }
+API_KEY="$(tr -d '[:space:]' <"$KEYFILE")"
+
+SYSTEM='Correct grammar, spelling, punctuation and collocations. Target an educated native register (C1). Replace calqued or literal expressions with the idiomatic equivalent. Cut redundancy and filler. In English, edit minimally and preserve the author'"'"'s voice; do not vary wording that is already correct. In other languages, restructure freely into natural idiomatic prose.
+Reply with only this JSON: {"text":"<corrected text>","note":"<at most 12 words: the one pattern worth learning, or empty if trivial>"}'
+
+ask() {
+    curl -sS --max-time 45 https://openrouter.ai/api/v1/chat/completions \
+        -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" \
+        -H "HTTP-Referer: https://localhost/grammar-fix" -H "X-Title: grammar-fix" \
+        -d "$(jq -n --arg m "$1" --arg s "$SYSTEM" --arg t "$TEXT" '{
+              model: $m, temperature: 0, max_tokens: 2048,
+              messages: [{role:"system",content:$s},{role:"user",content:$t}],
+              provider: {data_collection: "deny"}
+            }')"
+}
+
+RESPONSE="$(ask "$PRIMARY" || true)"
+CONTENT="$(jq -er '.choices[0].message.content' <<<"$RESPONSE" 2>/dev/null)" || {
+    RESPONSE="$(ask "$FALLBACK" || true)"
+    CONTENT="$(jq -er '.choices[0].message.content' <<<"$RESPONSE" 2>/dev/null)" || {
+        notify "Grammar fix failed" "$(jq -r '.error.message // "no response"' <<<"$RESPONSE" 2>/dev/null)"
+        printf '%s' "$TEXT"; exit 0; }
+}
+
+PARSED="$(printf '%s' "$CONTENT" | python3 -I -c '
+import json, re, sys
+raw = sys.stdin.read().strip()
+raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw).strip()
+text, note = raw, ""
+try:
+    obj = json.loads(raw)
+    if isinstance(obj, dict) and "text" in obj:
+        text = str(obj["text"]); note = str(obj.get("note") or "")
+except Exception:
+    pass
+sys.stdout.write(text + "\x1f" + note)
+')"
+FIXED="${PARSED%%$'\x1f'*}"
+NOTE="${PARSED#*$'\x1f'}"
+
+[[ -n "$FIXED" ]] || { printf '%s' "$TEXT"; exit 0; }
+emit_diff "$TEXT" "$FIXED" "$NOTE"
+printf '%s' "$FIXED"

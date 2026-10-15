@@ -8,7 +8,7 @@ LT_URL="${LT_URL:-http://localhost:8081/v2/check}"
 LANG_CODE="${LT_LANG:-auto}"
 HELPER="$HOME/.config/hypr/scripts/lt-apply.py"
 
-notify() { notify-send -a "grammar-fix" -t 3000 "$1" "${2:-}"; }
+notify() { notify-send -a "grammar-fix" -t "${NOTIFY_MS:-12000}" "$1" "${2:-}"; }
 
 # ydotoold's socket, as created by the user unit (systemctl --user start ydotool).
 export YDOTOOL_SOCKET="${YDOTOOL_SOCKET:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/.ydotool_socket}"
@@ -17,6 +17,33 @@ if [[ ! -S "$YDOTOOL_SOCKET" ]]; then
     notify "ydotoold not running" "systemctl --user enable --now ydotool"
     exit 1
 fi
+
+# Terminals use Ctrl+Shift+C/V; Ctrl+C there sends SIGINT instead of copying.
+# Detect the focused window class and pick the right chord.
+TERMINAL_CLASSES="${TERMINAL_CLASSES:-kitty|Alacritty|foot|footclient|org.wezfurlong.wezterm|com.mitchellh.ghostty|org.gnome.Terminal|konsole|xterm|URxvt|st-256color|WezTerm}"
+
+FOCUSED_CLASS="$(hyprctl activewindow -j 2>/dev/null | jq -r '.class // empty' 2>/dev/null || true)"
+if [[ -n "$FOCUSED_CLASS" ]] && printf '%s' "$FOCUSED_CLASS" | grep -qiE "^(${TERMINAL_CLASSES})$"; then
+    USE_SHIFT=1
+else
+    USE_SHIFT=0
+fi
+
+# 29=ctrl 42=shift 46=c 47=v
+do_copy() {
+    if [[ $USE_SHIFT -eq 1 ]]; then
+        ydotool key --key-delay 12 29:1 42:1 46:1 46:0 42:0 29:0
+    else
+        ydotool key --key-delay 12 29:1 46:1 46:0 29:0
+    fi
+}
+do_paste() {
+    if [[ $USE_SHIFT -eq 1 ]]; then
+        ydotool key --key-delay 12 29:1 42:1 47:1 47:0 42:0 29:0
+    else
+        ydotool key --key-delay 12 29:1 47:1 47:0 29:0
+    fi
+}
 
 OLD_CLIP="$(wl-paste 2>/dev/null || true)"
 restore_clip() { printf '%s' "$OLD_CLIP" | wl-copy 2>/dev/null || true; }
@@ -28,7 +55,7 @@ printf '%s' "$SENTINEL" | wl-copy
 sleep 0.1
 
 copy_selection() {
-    ydotool key --key-delay 12 29:1 46:1 46:0 29:0   # ctrl+c
+    do_copy
 }
 
 TEXT=""
@@ -97,7 +124,7 @@ fi
 
 printf '%s' "$FIXED" | wl-copy
 sleep 0.25
-ydotool key --key-delay 12 29:1 47:1 47:0 29:0   # ctrl+v
+do_paste
 sleep 0.35
 
 restore_clip
@@ -106,7 +133,7 @@ restore_clip
 # corrections to fit in a notification.
 DIFFS="$(sed -n '2p' "$ERRFILE")"
 if [[ -n "$DIFFS" ]]; then
-    notify "Fixed $COUNT · $DETECTED" "$DIFFS"
+    notify "Fixed $COUNT" "$DIFFS"
 else
-    notify "Fixed $COUNT issue(s)" "$DETECTED"
+    notify "Fixed $COUNT issue(s)" ""
 fi

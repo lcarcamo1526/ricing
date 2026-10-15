@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# Correct a file in place with the LLM. Used by nchat's spell_check_command,
+# which passes the compose buffer as a temp file and reads the file back.
+#
+#   spell_check_command=/home/you/.config/hypr/scripts/grammar-fix-file
+
+set -euo pipefail
+
+FILE="${1:?usage: grammar-fix-file <file>}"
+KEYFILE="$HOME/.config/hypr/scripts/.openrouter-key"
+PRIMARY="${LLM_MODEL:-anthropic/claude-haiku-5.5}"
+FALLBACK="${LLM_FALLBACK:-openai/gpt-oss-20b}"
+
+notify() { notify-send -a "grammar-fix" -t "${NOTIFY_MS:-12000}" "$1" "${2:-}" 2>/dev/null || true; }
+
+[[ -r "$KEYFILE" ]] || { notify "No OpenRouter key" "$KEYFILE"; exit 0; }
+API_KEY="$(tr -d '[:space:]' <"$KEYFILE")"
+
+TEXT="$(cat "$FILE")"
+[[ -n "${TEXT//[[:space:]]/}" ]] || exit 0
+
+SYSTEM='Correct grammar, spelling, punctuation and collocations. Target an educated native register (C1). Replace calqued or literal expressions with the idiomatic equivalent. Cut redundancy and filler. In English, edit minimally and preserve the author'"'"'s voice; do not vary wording that is already correct. In other languages, restructure freely into natural idiomatic prose.
+Reply with only this JSON: {"text":"<corrected text>","note":"<at most 12 words: the one pattern worth learning, or empty if trivial>"}'
+
+ask() {
+    curl -sS --max-time 45 https://openrouter.ai/api/v1/chat/completions \
+        -H "Authorization: Bearer $API_KEY" \
+        -H "Content-Type: application/json" \
+        -H "HTTP-Referer: https://localhost/grammar-fix" \
+        -H "X-Title: grammar-fix" \
+        -d "$(jq -n --arg m "$1" --arg s "$SYSTEM" --arg t "$TEXT" '{
+              model: $m, temperature: 0, max_tokens: 2048,
+              messages: [{role:"system",content:$s},{role:"user",content:$t}],
+              provider: {data_collection: "deny"}
+            }')"
+}
+
+RESPONSE="$(ask "$PRIMARY" || true)"
+CONTENT="$(jq -er '.choices[0].message.content' <<<"$RESPONSE" 2>/dev/null)" || {
+    RESPONSE="$(ask "$FALLBACK" || true)"
+    CONTENT="$(jq -er '.choices[0].message.content' <<<"$RESPONSE" 2>/dev/null)" || {
+        notify "Grammar fix failed" "$(jq -r '.error.message // "no response"' <<<"$RESPONSE" 2>/dev/null)"
+        exit 0   # leave the buffer untouched
+    }
+}
+
+PARSED="$(printf '%s' "$CONTENT" | python3 -I -c '
+import json, re, sys
+raw = sys.stdin.read().strip()
+raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw).strip()
+text, note = raw, ""
+try:
+    obj = json.loads(raw)
+    if isinstance(obj, dict) and "text" in obj:
+        text = str(obj["text"]); note = str(obj.get("note") or "")
+except Exception:
+    pass
+sys.stdout.write(text + "\x1f" + note)
+')"
+FIXED="${PARSED%%$'\x1f'*}"
+NOTE="${PARSED#*$'\x1f'}"
+
+[[ -n "$FIXED" ]] || exit 0
+
+if [[ "$FIXED" == "$TEXT" ]]; then
+    notify "No changes needed" ""
+    exit 0
+fi
+
+printf '%s' "$FIXED" > "$FILE"
+
+DIFF_OUT="$(python3 -I "$HOME/.config/hypr/scripts/word-diff.py" "$TEXT" "$FIXED" 2>/dev/null || true)"
+COUNT="$(sed -n 's/^COUNT=//p' <<<"$DIFF_OUT")"
+DETAIL="$(sed -n '2p' <<<"$DIFF_OUT")"
+BODY="$DETAIL"
+[[ -n "$NOTE" ]] && BODY="${BODY:+$BODY$'\n'}💡 $NOTE"
+notify "Fixed ${COUNT:-?}" "$BODY"
